@@ -643,6 +643,20 @@ void spdk_blob_resize(struct spdk_blob *blob, uint64_t sz, spdk_blob_op_complete
 		      void *cb_arg);
 
 /**
+ * Free clusters of blob. These changes are not persisted to disk until
+ * spdk_bs_md_sync_blob() is called.
+ * If called before previous free space finish, it will fail with errno -EBUSY
+ *
+ * \param blob Blob on which to operate.
+ * \param offset Offset is in io units from the beginning of the blob where the deallocation shall begin, and must be aligned with the boundary of cluster.
+ * \param length Length for range deallocate, in io units, and must be multiple of the cluster size.
+ * \param cb_fn Called when the operation is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_blob_deallocate(struct spdk_blob *blob, uint64_t offset, uint64_t length,
+			  spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
  * Set blob as read only.
  *
  * These changes do not take effect until spdk_blob_sync_md() is called.

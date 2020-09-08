@@ -240,6 +240,26 @@ fuse_rename(const char *old_path, const char *new_path, unsigned int flags)
 	return spdk_fs_rename_file(thd_bfuse->fs, thd_bfuse->channel, old_path, new_path);
 }
 
+static int
+fuse_fallocate(const char *path, int mode, off_t offset, off_t size, struct fuse_file_info *fi)
+{
+	struct spdk_file *file;
+	int rc;
+
+	rc = spdk_fs_open_file(thd_bfuse->fs, thd_bfuse->channel, path, 0, &file);
+	if (rc != 0) {
+		return -rc;
+	}
+
+	rc = spdk_file_fallocate(file, thd_bfuse->channel, mode, offset, size);
+	if (rc != 0) {
+		return -rc;
+	}
+
+	spdk_file_close(file, thd_bfuse->channel);
+	return 0;
+}
+
 static struct fuse_operations spdk_fuse_oper = {
 	.getattr	= fuse_getattr,
 	.readdir	= fuse_readdir,
@@ -254,6 +274,7 @@ static struct fuse_operations spdk_fuse_oper = {
 	.flush		= fuse_flush,
 	.fsync		= fuse_fsync,
 	.rename		= fuse_rename,
+	.fallocate      = fuse_fallocate,
 };
 
 static void *

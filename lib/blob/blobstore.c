@@ -7480,4 +7480,131 @@ spdk_blob_get_clones(struct spdk_blob_store *bs, spdk_blob_id blobid, spdk_blob_
 	return 0;
 }
 
+static uint64_t
+bs_io_units_per_cluster(struct spdk_blob_store *bs)
+{
+	uint8_t shift = bs->pages_per_cluster_shift;
+
+	if (shift != 0) {
+		return (bs_io_unit_per_page(bs) << shift);
+	}
+
+	return (bs_io_unit_per_page(bs) * bs->pages_per_cluster);
+}
+
+struct spdk_deallocate_ctx {
+	spdk_blob_op_complete cb_fn;
+	void *cb_arg;
+	struct spdk_blob *blob;
+	uint64_t offset;
+	uint64_t length;
+	int rc;
+};
+
+static void
+bs_deallocate_unfreeze_cpl(void *cb_arg, int rc)
+{
+	struct spdk_deallocate_ctx *ctx = (struct spdk_deallocate_ctx *)cb_arg;
+
+	if (0 != rc) {
+		SPDK_ERRLOG("Unfreeze failed, rc = %d\n", rc);
+	}
+
+	if (ctx->rc != 0) {
+		SPDK_ERRLOG("Unfreeze failed, ctx->rc = %d\n", ctx->rc);
+		rc = ctx->rc;
+	}
+
+	ctx->blob->locked_operation_in_progress = false;
+	ctx->cb_fn(ctx->cb_arg, rc);
+	free(ctx);
+}
+
+static void
+bs_deallocate_freeze_cpl(void *cb_arg, int rc)
+{
+	struct spdk_deallocate_ctx *ctx = (struct spdk_deallocate_ctx *)cb_arg;
+	struct spdk_blob *blob = ctx->blob;
+	uint64_t offset = ctx->offset;
+	uint64_t length = ctx->length;
+	uint64_t op_length;
+	uint64_t lba;
+	uint32_t cluster_offset;
+	struct spdk_blob_store *bs;
+
+	blob_verify_md_op(blob);
+	if (rc != 0) {
+		ctx->blob->locked_operation_in_progress = false;
+		ctx->cb_fn(ctx->cb_arg, rc);
+		free(ctx);
+		return;
+	}
+
+	if (0 == length || length < bs_io_units_per_cluster(blob->bs)) {
+		ctx->rc = 0;
+		goto out;
+	}
+
+	bs = blob->bs;
+	while (length > 0) {
+		op_length = spdk_min(length, bs_num_io_units_to_cluster_boundary(blob, offset));
+
+		SPDK_DEBUGLOG(blob, "{off:%lu len:%lu} op_length:%lu\n", offset, length, op_length);
+
+		cluster_offset = bs_page_to_cluster(bs, offset);
+		lba = blob->active.clusters[cluster_offset];
+		blob->active.clusters[cluster_offset] = 0;
+		bs_release_cluster(bs, bs_lba_to_cluster(bs, lba));
+
+		length -= op_length;
+		offset += op_length;
+	}
+	blob_set_thin_provision(blob);
+
+out:
+	blob_unfreeze_io(ctx->blob, bs_deallocate_unfreeze_cpl, ctx);
+}
+
+void
+spdk_blob_deallocate(struct spdk_blob *blob, uint64_t offset, uint64_t length,
+		     spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_deallocate_ctx *ctx;
+	struct spdk_blob_store *bs;
+
+	blob_verify_md_op(blob);
+
+	if (blob->md_ro) {
+		cb_fn(cb_arg, -EPERM);
+		return;
+	}
+
+	bs = blob->bs;
+	if (offset % (bs->cluster_sz / bs->dev->blocklen) != 0 ||
+	    length % (bs->cluster_sz / bs->dev->blocklen) != 0) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	if (blob->locked_operation_in_progress) {
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	blob->locked_operation_in_progress = true;
+	ctx->cb_fn  = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->blob   = blob;
+	ctx->offset = offset;
+	ctx->length = length;
+
+	blob_freeze_io(blob, bs_deallocate_freeze_cpl, ctx);
+}
+
 SPDK_LOG_REGISTER_COMPONENT(blob)

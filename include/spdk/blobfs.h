@@ -592,6 +592,20 @@ void spdk_file_read_async(struct spdk_file *file, struct spdk_io_channel *channe
 void spdk_file_sync_async(struct spdk_file *file, struct spdk_io_channel *channel,
 			  spdk_file_op_complete cb_fn, void *cb_arg);
 
+/**
+ * fallocate allows the caller to directly manipulate the allocated disk space for the file.
+ *
+ * \param file File to fallocate.
+ * \param ctx The thread context for this operation.
+ * \param mode Mode determines the operation to be performed on the given range.
+ * \param offset The beginning position to fallocate.
+ * \param length The size in bytes of disk space to fallocate.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_file_fallocate(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx, int mode,
+			uint64_t offset, uint64_t length);
+
 #ifdef __cplusplus
 }
 #endif

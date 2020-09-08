@@ -40,6 +40,7 @@
 	spdk_file_write_async;
 	spdk_file_read_async;
 	spdk_file_sync_async;
+	spdk_file_fallocate;
 
 	local: *;
 };

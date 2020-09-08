@@ -246,6 +246,11 @@ struct spdk_fs_cb_args {
 		struct {
 			const char	*name;
 		} stat;
+		struct {
+			uint64_t	offset;
+			uint64_t	length;
+			int	mode;
+		} fallocate;
 	} op;
 };
 
@@ -2968,6 +2973,349 @@ file_free(struct spdk_file *file)
 	assert(file->tree->present_mask == 0);
 	spdk_thread_send_msg(g_cache_pool_thread, _file_free, file);
 	pthread_spin_unlock(&file->lock);
+}
+
+static void
+__write_zeroes_range_impl_done(void *ctx, int bserrno)
+{
+	struct spdk_fs_request *req = ctx;
+
+	__wake_caller(&req->args, bserrno);
+}
+
+static void
+__write_zeroes_range_done(void *ctx, int bserrno)
+{
+	struct spdk_fs_request *req = ctx;
+	struct spdk_fs_cb_args *args = &req->args;
+
+	args->fn.file_op(args->arg, bserrno);
+	free_fs_request(req);
+}
+
+
+static void
+__write_zeroes_range_impl(struct spdk_file *file, struct spdk_io_channel *_channel,
+			  uint64_t offset, uint64_t length, spdk_file_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_fs_request *req;
+	struct spdk_fs_cb_args *args;
+	struct spdk_fs_channel *channel = spdk_io_channel_get_ctx(_channel);
+	uint64_t start_lba, num_lba;
+	uint32_t lba_size;
+
+	req = alloc_fs_request(channel);
+	if (req == NULL) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	__get_page_parameters(file, offset, length, &start_lba, &lba_size, &num_lba);
+
+	args = &req->args;
+	args->fn.file_op = cb_fn;
+	args->arg = cb_arg;
+	args->file = file;
+	args->op.rw.channel = channel->bs_channel;
+
+	args->op.rw.offset = offset;
+	args->op.rw.blocklen = lba_size;
+
+	args->op.rw.length = num_lba * lba_size;
+
+	args->op.rw.start_lba = start_lba;
+	args->op.rw.num_lba = num_lba;
+
+	spdk_blob_io_write_zeroes(args->file->blob, args->op.rw.channel,
+				  args->op.rw.start_lba, args->op.rw.num_lba, __write_zeroes_range_done, req);
+}
+
+static void
+__write_zeroes_range_async(void *ctx)
+{
+	struct spdk_fs_request *req = ctx;
+	struct spdk_fs_cb_args *args = &req->args;
+	struct spdk_file *file = args->file;
+	uint64_t length;
+
+	length = (args->op.rw.offset + args->op.rw.length) < spdk_file_get_length(file) ?
+		 args->op.rw.length : (spdk_file_get_length(file) - args->op.rw.offset);
+
+	__write_zeroes_range_impl(file, file->fs->sync_target.sync_io_channel,
+				  args->op.rw.offset, length, __write_zeroes_range_impl_done, req);
+}
+
+static int
+__write_zeroes_range(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx, uint64_t offset,
+		     uint64_t length)
+{
+	struct spdk_fs_channel *channel = (struct spdk_fs_channel *)ctx;
+	struct spdk_fs_request *req;
+	struct spdk_fs_cb_args *args;
+
+	if (0 == length) {
+		return 0;
+	}
+
+	req = alloc_fs_request(channel);
+	if (NULL == req) {
+		return -ENOMEM;
+	}
+
+	args = &req->args;
+	args->file = file;
+	args->sem = &channel->sem;
+	args->op.rw.offset  = offset;
+	args->op.rw.length  = length;
+
+	file->fs->send_request(__write_zeroes_range_async, req);
+	sem_wait(&channel->sem);
+	free_fs_request(req);
+
+	return args->rc;
+}
+
+static void
+__blob_free_file_space_done(void *ctx, int bserrno)
+{
+	struct spdk_fs_request *req = ctx;
+
+	__wake_caller(&req->args, bserrno);
+}
+
+static void
+__blob_free_file_space_cb(void *ctx, int bserrno)
+{
+	struct spdk_fs_request *req = ctx;
+	struct spdk_fs_cb_args *args = &req->args;
+	struct spdk_file       *file = args->file;
+
+	if (bserrno) {
+		__blob_free_file_space_done(req, bserrno);
+		return;
+	}
+	spdk_blob_sync_md(file->blob, __blob_free_file_space_done, req);
+}
+
+static void
+__blob_free_file_space(void *ctx)
+{
+	struct spdk_fs_request *req = ctx;
+	struct spdk_fs_cb_args *args = &req->args;
+	struct spdk_file       *file = args->file;
+	uint64_t start_lba, num_lba;
+	uint32_t lba_size;
+	uint64_t length;
+
+	length = (args->op.fallocate.offset + args->op.fallocate.length) < spdk_file_get_length(file) ?
+		 args->op.fallocate.length : (spdk_file_get_length(file) - args->op.fallocate.offset);
+
+	__get_page_parameters(file, args->op.fallocate.offset, length,
+			      &start_lba, &lba_size, &num_lba);
+	spdk_blob_deallocate(file->blob, start_lba, num_lba, __blob_free_file_space_cb, req);
+}
+
+static int
+__send_blob_free_file_space(struct spdk_file *file, uint64_t offset, uint64_t length,
+			    struct spdk_fs_channel *channel)
+{
+	struct spdk_fs_request *req;
+	struct spdk_fs_cb_args *args;
+
+	req = alloc_fs_request(channel);
+	if (NULL == req) {
+		SPDK_ERRLOG("Cannot allocate free file space req on file %s\n", file->name);
+		return -ENOMEM;
+	}
+
+	args = &req->args;
+	args->file = file;
+	args->sem = &channel->sem;
+	args->op.fallocate.offset = offset;
+	args->op.fallocate.length = length;
+
+	file->fs->send_request(__blob_free_file_space, req);
+	sem_wait(&channel->sem);
+	free_fs_request(req);
+
+	return args->rc;
+}
+
+static void
+__fallocate_resize_done(void *ctx, int bserrno)
+{
+	struct spdk_fs_request *req = ctx;
+
+	__wake_caller(&req->args, bserrno);
+}
+
+static void
+__fallocate_resize_cb(void *ctx, int bserrno)
+{
+	struct spdk_fs_request *req = ctx;
+	struct spdk_fs_cb_args *args = &req->args;
+	struct spdk_file       *file = args->file;
+	uint64_t new_size;
+
+	if (bserrno) {
+		__fallocate_resize_done(req, bserrno);
+		return;
+	}
+
+	new_size = args->op.fallocate.offset + args->op.fallocate.length;
+	spdk_blob_set_xattr(file->blob, "length", &new_size, sizeof(new_size));
+
+	file->length = new_size;
+
+	spdk_blob_sync_md(file->blob, __fallocate_resize_done, req);
+}
+
+static void
+__fallocate_resize(void *ctx)
+{
+	size_t num_clusters;
+	struct spdk_fs_request *req = ctx;
+	struct spdk_fs_cb_args *args = &req->args;
+	struct spdk_file       *file = args->file;
+	struct spdk_filesystem *fs = file->fs;
+	uint64_t new_size;
+
+	new_size = args->op.fallocate.offset + args->op.fallocate.length;
+	num_clusters = __bytes_to_clusters(new_size, fs->bs_opts.cluster_sz);
+
+	spdk_blob_resize(file->blob, num_clusters, __fallocate_resize_cb, req);
+}
+
+static int
+__send_fallocate_resize(struct spdk_file *file, uint64_t offset, uint64_t length,
+			struct spdk_fs_channel *channel)
+{
+	struct spdk_fs_request *req;
+	struct spdk_fs_cb_args *args;
+
+	req = alloc_fs_request(channel);
+	if (NULL == req) {
+		SPDK_ERRLOG("Cannot allocate resize req on file=%s\n", file->name);
+		return -ENOMEM;
+	}
+
+	args = &req->args;
+	args->file = file;
+	args->sem = &channel->sem;
+	args->op.fallocate.offset = offset;
+	args->op.fallocate.length = length;
+
+	file->fs->send_request(__fallocate_resize, req);
+	sem_wait(&channel->sem);
+	free_fs_request(req);
+
+	return args->rc;
+}
+
+static uint64_t
+__current_cache_buffer_offset(uint64_t offset)
+{
+	return (offset & ~(CACHE_TREE_LEVEL_MASK(0)));
+}
+
+#if defined(__FreeBSD__)
+#define FALLOC_FL_KEEP_SIZE  0x01
+#define FALLOC_FL_PUNCH_HOLE 0x02
+#endif
+
+#define BLOBFS_FALLOC_FL_SUPPORTED   \
+	(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE)
+
+int
+spdk_file_fallocate(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
+		    int mode, uint64_t offset, uint64_t length)
+{
+	struct spdk_fs_channel *channel = (struct spdk_fs_channel *)ctx;
+	uint64_t rem_length;
+	uint64_t current_offset, cache_offset;
+	uint64_t to_next_boundary, data_len;
+	struct cache_buffer *buf;
+	int rc = 0;
+
+	if (mode & ~BLOBFS_FALLOC_FL_SUPPORTED) {
+		return -EOPNOTSUPP;
+	}
+
+	if (0 == length) {
+		return 0;
+	}
+
+	if (offset > file->append_pos) {
+		SPDK_ERRLOG(" fallocate can't support offset=%jx behind of apend_pos=%jx\n",
+			    offset, file->append_pos);
+		return -EINVAL;
+	}
+
+	pthread_spin_lock(&file->lock);
+
+	/*
+	 * flush the cached range
+	 */
+	if (mode & FALLOC_FL_PUNCH_HOLE) {
+		BLOBFS_TRACE(file, " offset=%jx length=%jx mode=%d with FALLOC_FL_PUNCH_HOLE\n",
+			     offset, length, mode);
+
+		/* flush all dirty data before fallocate */
+		if (offset + length > file->length_flushed) {
+			pthread_spin_unlock(&file->lock);
+			rc = spdk_file_sync(file, ctx);
+			if (rc != 0) {
+				SPDK_ERRLOG("Flush with errno: %d\n", rc);
+				return rc;
+			}
+			pthread_spin_lock(&file->lock);
+		}
+
+		file->open_for_writing = true;
+		rem_length = length;
+		current_offset = offset;
+
+		/* remove read only cache buffer which overlap with offset + length */
+		while (rem_length > 0) {
+			to_next_boundary = __next_cache_buffer_offset(current_offset) - current_offset;
+			data_len = spdk_min(rem_length, to_next_boundary);
+
+			cache_offset = __current_cache_buffer_offset(current_offset);
+			buf = tree_find_filled_buffer(file->tree, cache_offset);
+			if (buf) {
+				assert(buf->bytes_filled == buf->bytes_flushed);
+				tree_remove_buffer(file->tree, buf);
+			}
+
+			current_offset += data_len;
+			rem_length -= data_len;
+		}
+
+		pthread_spin_unlock(&file->lock);
+
+		rc = __write_zeroes_range(file, ctx, offset, length);
+		if (0 != rc) {
+			SPDK_ERRLOG("__write_zeroes_range error rc:%d\n", rc);
+			goto out;
+		}
+
+		rc = __send_blob_free_file_space(file, offset, length, channel);
+		if (0 != rc) {
+			SPDK_ERRLOG("__send_blob_fallocate failed!!! rc:%d\n", rc);
+			goto out;
+		}
+	} else {
+		if (!(mode & FALLOC_FL_KEEP_SIZE) && (offset + length) > spdk_file_get_length(file)) {
+			pthread_spin_unlock(&file->lock);
+			rc = __send_fallocate_resize(file, offset, length, channel);
+			if (rc) {
+				goto out;
+			}
+		}
+	}
+
+out:
+	return rc;
 }
 
 SPDK_LOG_REGISTER_COMPONENT(blobfs)
