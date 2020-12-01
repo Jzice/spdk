@@ -2,6 +2,12 @@
 
 ## v21.01: (Upcoming Release)
 
+### blobfs
+
+A new API `spdk_file_randomwrite` was added to enable random writes to a file.  The API
+can't support write ahead of last valid append position which means we can only update
+old data which is already in the disk.
+
 ### nvmf
 
 The functions `destroy` and `qpair_fini` in the transport interface now accept a
