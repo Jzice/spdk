@@ -291,10 +291,12 @@ function set_test_storage() {
 	requested_size=$((requested_size + (64 << 20)))
 
 	while read -r source fs size use avail _ mount; do
-		mounts["$mount"]=$source fss["$mount"]=$fs
-		avails["$mount"]=$((avail * 1024)) sizes["$mount"]=$((size * 1024))
+		mounts["$mount"]=$source
+        fss["$mount"]=$fs
+		avails["$mount"]=$((avail * 1024))
+        sizes["$mount"]=$((size * 1024))
 		uses["$mount"]=$((use * 1024))
-	done < <(df -T | grep -v Filesystem)
+    done < <(df -T | awk '{if(NR>1){print}}' )
 
 	printf '* Looking for test storage...\n' >&2
 
@@ -302,7 +304,7 @@ function set_test_storage() {
 	for target_dir in "${storage_candidates[@]}"; do
 		# FreeBSD's df is lacking the --output arg
 		# mount=$(df --output=target "$target_dir" | grep -v "Mounted on")
-		mount=$(df "$target_dir" | awk '$1 !~ /Filesystem/{print $6}')
+        mount=$(df "$target_dir" | awk '{if(NR>1){print $6}}')
 
 		target_space=${avails["$mount"]}
 		if ((target_space == 0 || target_space < requested_size)); then
