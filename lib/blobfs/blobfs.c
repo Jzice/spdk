@@ -31,7 +31,7 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "spdk/stdinc.h"
+#include <spdk/stdinc.h>
 
 #include "spdk/blobfs.h"
 #include "tree.h"
@@ -936,6 +936,36 @@ fs_find_file(struct spdk_filesystem *fs, const char *name)
 	return NULL;
 }
 
+struct spdk_file **
+spdk_fs_get_files_by_prefix(struct spdk_filesystem *fs, struct spdk_fs_thread_ctx *ctx, const char *prefix)
+{
+	struct spdk_file *file = NULL, *tmp = NULL;
+    struct spdk_file **files = NULL;
+    size_t file_count = 0;
+
+	pthread_spin_lock(&ctx->ch.lock);
+    size_t len = strlen(prefix);
+	TAILQ_FOREACH_SAFE(file, &fs->files, tailq, tmp) {
+		if (!strncmp(prefix, file->name, len)) {
+            file_count++;
+		}
+	}
+
+    if (file_count > 0) {
+        files = calloc(file_count, sizeof(*files));
+        size_t i= 0;
+        TAILQ_FOREACH_SAFE(file, &fs->files, tailq, tmp) {
+            if (i<file_count && !strncmp(prefix, file->name, len)) {
+                files[i++] = file;
+            }
+        }
+    }
+
+	pthread_spin_unlock(&ctx->ch.lock);
+
+	return files;
+}
+
 void
 spdk_fs_file_stat_async(struct spdk_filesystem *fs, const char *name,
 			spdk_file_stat_op_complete cb_fn, void *cb_arg)
@@ -1008,6 +1038,20 @@ spdk_fs_file_stat(struct spdk_filesystem *fs, struct spdk_fs_thread_ctx *ctx,
 	free_fs_request(req);
 
 	return rc;
+}
+
+static uint64_t
+spdk_fs_total_size(struct spdk_filesystem *fs)
+{
+	assert(fs != NULL);
+    return spdk_bs_get_total_data_size(fs->bs);
+}
+
+static uint64_t
+spdk_fs_free_size(struct spdk_filesystem *fs)
+{
+	assert(fs != NULL);
+    return spdk_bs_get_free_cluster_size(fs->bs);
 }
 
 static void
@@ -1595,6 +1639,26 @@ spdk_fs_iter_next(spdk_fs_iter iter)
 	f = TAILQ_NEXT(f, tailq);
 	return f;
 }
+
+const char *
+spdk_fs_iter_get_name(spdk_fs_iter iter)
+{
+	return ((struct spdk_file*)iter)->name;
+}
+
+int
+spdk_fs_iter_has_prefix(struct spdk_filesystem *fs, spdk_fs_iter iter, const char *prefix)
+{
+	struct spdk_file *f = iter;
+    int has = 0;
+    size_t len = strlen(prefix);
+    if (!strncmp(f->name, prefix,  len)) {
+        has = 1;
+    }
+
+    return has;
+}
+
 
 const char *
 spdk_file_get_name(struct spdk_file *file)
@@ -2560,6 +2624,14 @@ spdk_file_write(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 	return 0;
 }
 
+int
+spdk_file_write_append(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
+		void *payload, uint64_t length)
+{
+	return spdk_file_write(file, ctx, payload, file->append_pos, length);
+}
+
+
 static uint64_t
 __next_cache_buffer_offset(uint64_t offset)
 {
@@ -3296,6 +3368,13 @@ __send_fallocate_resize(struct spdk_file *file, uint64_t offset, uint64_t length
 #define BLOBFS_FALLOC_FL_SUPPORTED   \
 	(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE)
 
+uint64_t
+spdk_file_lseek(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
+		    uint64_t offset, int whence)
+{
+
+}
+
 int
 spdk_file_fallocate(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 		    int mode, uint64_t offset, uint64_t length)
@@ -3387,6 +3466,9 @@ spdk_file_fallocate(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 out:
 	return rc;
 }
+
+
+
 
 SPDK_LOG_REGISTER_COMPONENT(blobfs)
 SPDK_LOG_REGISTER_COMPONENT(blobfs_rw)

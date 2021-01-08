@@ -206,6 +206,85 @@ invalid:
 
 	cb_fn(cb_arg, rc);
 }
+
+static void
+_blobfs_bdev_open_even_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
+			  void *event_ctx)
+{
+	struct blobfs_bdev_operation_ctx *ctx = event_ctx;
+
+	SPDK_WARNLOG("Async event(%d) is triggered in bdev %s\n", type, spdk_bdev_get_name(bdev));
+
+	if (type == SPDK_BDEV_EVENT_REMOVE) {
+		//blobfs_fuse_stop(ctx->bfuse);
+	}
+}
+
+static void
+_blobfs_bdev_open_fs_load_cb(void *_ctx, struct spdk_filesystem *fs, int fserrno)
+{
+	struct blobfs_bdev_operation_ctx *ctx = _ctx;
+
+	if (fserrno) {
+		SPDK_ERRLOG("Failed to load blobfs on bdev %s: errno %d\n", ctx->bdev_name, fserrno);
+
+		ctx->cb_fn(ctx->cb_arg, fserrno);
+		free(ctx);
+		return;
+	}
+
+	ctx->fs = fs;
+	ctx->fs_loading_thread = spdk_get_thread();
+
+	//spdk_thread_send_msg(spdk_get_thread(), _blobfs_bdev_mount_fuse_start, ctx);
+}
+
+void
+spdk_blobfs_bdev_open(const char *bdev_name, 
+			spdk_blobfs_bdev_op_complete cb_fn, void *cb_arg)
+{
+	struct blobfs_bdev_operation_ctx *ctx;
+	struct spdk_bs_dev *bs_dev;
+	int rc;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_ERRLOG("Failed to allocate ctx.\n");
+		cb_fn(cb_arg, -ENOMEM);
+
+		return;
+	}
+
+	ctx->bdev_name = bdev_name;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	rc = spdk_bdev_create_bs_dev_ext(bdev_name, _blobfs_bdev_open_even_cb, ctx, &bs_dev);
+	if (rc != 0) {
+		SPDK_INFOLOG(blobfs_bdev, "Failed to create a blobstore block device from bdev (%s)",
+			     bdev_name);
+
+		goto invalid;
+	}
+
+	rc = spdk_bs_bdev_claim(bs_dev, &blobfs_bdev_module);
+	if (rc != 0) {
+		SPDK_INFOLOG(blobfs_bdev, "Blobfs base bdev already claimed by another bdev\n");
+		bs_dev->destroy(bs_dev);
+
+		goto invalid;
+	}
+
+	spdk_fs_load(bs_dev, blobfs_fuse_send_request, _blobfs_bdev_open_fs_load_cb, ctx);
+
+	return;
+
+invalid:
+	free(ctx);
+
+	cb_fn(cb_arg, rc);
+}
+
 SPDK_LOG_REGISTER_COMPONENT(blobfs_bdev)
 #ifdef SPDK_CONFIG_FUSE
 

@@ -5139,6 +5139,18 @@ spdk_bs_total_data_cluster_count(struct spdk_blob_store *bs)
 	return bs->total_data_clusters;
 }
 
+uint64_t
+spdk_bs_get_total_data_size(struct spdk_blob_store *bs)
+{
+	return bs->cluster_sz * bs->total_data_clusters;
+}
+
+uint64_t
+spdk_bs_get_free_cluster_size(struct spdk_blob_store *bs)
+{
+	return bs->cluster_sz * bs->num_free_clusters;
+}
+
 static int
 bs_register_md_thread(struct spdk_blob_store *bs)
 {
